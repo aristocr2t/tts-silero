@@ -1,0 +1,127 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: |
+          bash -n bin/voice
+          bash -n install.sh
+      - name: ShellCheck
+        run: shellcheck --severity=warning bin/voice install.sh
+      - name: PowerShell syntax
+        shell: pwsh
+        run: |
+          $Errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile('install.ps1', [ref]$null, [ref]$Errors) | Out-Null
+          if ($Errors) {
+            $Errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+          Write-Host 'install.ps1: синтаксис в порядке'
+
+  python:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: '3.10'
+          - os: ubuntu-latest
+            python: '3.13'
+          - os: macos-latest
+            python: '3.13'
+          - os: windows-latest
+            python: '3.13'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m compileall -q lib tests
+      - name: Install test dependencies
+        run: python -m pip install eng_to_ipa numpy soundfile
+      - name: Unit tests
+        env:
+          PYTHONPATH: lib
+          PYTHONUTF8: '1'
+        run: python -m unittest discover -s tests -v
+
+  cli:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies for the parser
+        run: python -m pip install eng_to_ipa numpy soundfile
+      - name: Usage works without ffmpeg
+        env:
+          PYTHONPATH: lib
+          PYTHONUTF8: '1'
+        run: python -m tts.cli --help
+      - name: voice.cmd checks Python and dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # зависимости для синтеза в этом job не ставятся, поэтому обёртка
+          # обязана отказать кодом 2 до запуска CLI, а не упасть трейсбеком
+          $env:VOICE_PYTHON = (Get-Command python).Source
+          $output = & cmd /c 'bin\voice.cmd --help' 2>&1
+          $code = $LASTEXITCODE
+          Write-Output $output
+          if ($code -ne 2) {
+            Write-Error "voice.cmd вернул $code вместо 2"
+            exit 1
+          }
+          if (($output -join "`n") -match 'Traceback') {
+            Write-Error 'voice.cmd выполнил CLI вместо проверки зависимостей'
+            exit 1
+          }
+      - name: Bad option value is rejected
+        env:
+          PYTHONPATH: lib
+          PYTHONUTF8: '1'
+        shell: bash
+        run: |
+          if python -m tts.cli --chunk 0 "текст" >/dev/null 2>&1; then
+            echo "нулевой --chunk должен быть отвергнут" >&2
+            exit 1
+          fi
+      - name: Old interpreter is reported, not crashed
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cat > /tmp/old-python <<'STUB'
+          #!/usr/bin/env bash
+          exit 1
+          STUB
+          chmod +x /tmp/old-python
+
+          if VOICE_PYTHON=/tmp/old-python ./bin/voice --no-play "текст" 2>/tmp/old-error; then
+            echo "старый интерпретатор должен быть отвергнут" >&2
+            exit 1
+          fi
+
+          grep -q 'старше Python 3.10' /tmp/old-error

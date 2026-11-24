@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Точка входа для macOS и Linux: находит каталог репозитория даже через
+# символическую ссылку, выбирает интерпретатор и передаёт управление
+# lib/tts/cli.py. Вся логика озвучки — в Python, поэтому Windows использует
+# тот же код через bin/voice.cmd.
+
+set -euo pipefail
+
+source_path="${BASH_SOURCE[0]}"
+
+while [[ -L $source_path ]]; do
+  source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+  source_path="$(readlink "$source_path")"
+
+  case $source_path in
+    /*) ;;
+    *) source_path="$source_dir/$source_path";;
+  esac
+done
+
+TTS_ROOT="$(cd -P "$(dirname "$source_path")/.." && pwd)"
+
+fail() {
+  printf 'voice: %s\n' "$*" >&2
+
+  exit 2
+}
+
+check_version() {
+  "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null
+}
+
+check_dependencies() {
+  "$1" -c 'import eng_to_ipa, numpy, soundfile, silero' 2>/dev/null
+}
+
+find_python() {
+  # порядок: VOICE_PYTHON -> venv репозитория -> python3, но только с зависимостями
+  local python
+
+  if [[ -n ${VOICE_PYTHON:-} ]]; then
+    [[ -x ${VOICE_PYTHON} ]] || fail "VOICE_PYTHON не исполняемый: $VOICE_PYTHON"
+    check_version "${VOICE_PYTHON}" \
+      || fail "${VOICE_PYTHON} старше Python 3.10"
+    check_dependencies "${VOICE_PYTHON}" \
+      || fail "в ${VOICE_PYTHON} нет зависимостей: ${VOICE_PYTHON} -m pip install -r $TTS_ROOT/requirements.txt"
+
+    printf '%s' "${VOICE_PYTHON}"
+
+    return
+  fi
+
+  for python in "$TTS_ROOT/.venv/bin/python" python3; do
+    if ! command -v "$python" >/dev/null; then
+      continue
+    fi
+
+    check_version "$python" || continue
+
+    if check_dependencies "$python"; then
+      printf '%s' "$python"
+
+      return
+    fi
+  done
+
+  fail "не нашла интерпретатор с зависимостями; выполните $TTS_ROOT/install.sh или задайте VOICE_PYTHON"
+}
+
+python=$(find_python)
+
+export PYTHONPATH="$TTS_ROOT/lib"
+export PYTHONWARNINGS=ignore
+
+exec "$python" -m tts.cli "$@"
